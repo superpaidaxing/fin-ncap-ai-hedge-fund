@@ -257,3 +257,17 @@ def test_blind_render_is_opt_in():
     snap = build_snapshot("TEST", "2025-01-15", MockDataClient(metrics=_history()))
     assert snap.render() == snap.render(blind=False)
     assert "Company: TEST" in snap.render()
+
+
+def test_blind_mode_exposes_chronic_negative_fcf_sign_audit():
+    """Fixes the blind-mode '-' FCF disappearance bug when oldest FCF <= 0."""
+    metrics = _history(4)
+    for m in metrics:
+        m.free_cash_flow_per_share = -1.25
+    snap = build_snapshot("TEST", "2025-01-15", MockDataClient(metrics=metrics))
+    assert snap.negative_fcf_periods == 4
+    blind_text = snap.render(blind=True)
+    assert "FCF sign audit" in blind_text
+    assert "4/4 negative" in blind_text
+    assert "NEG NEG NEG NEG" in blind_text
+

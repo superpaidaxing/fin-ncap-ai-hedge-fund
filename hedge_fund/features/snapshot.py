@@ -21,6 +21,8 @@ from pydantic import BaseModel
 
 from hedge_fund.data.protocol import DataClient
 from hedge_fund.features.breakpoints import MEBreakpoints
+from hedge_fund.forensic.gate import ForensicAccountingGate
+from hedge_fund.forensic.models import ForensicAuditResult
 
 # An agent can't say anything defensible about a company with less history
 # than this (one year of ttm rows).
@@ -43,7 +45,12 @@ class PeriodFundamentals(BaseModel):
     operating_margin: float | None = None
     net_margin: float | None = None
     debt_to_equity: float | None = None
+    debt_to_assets: float | None = None
     current_ratio: float | None = None
+    cash_ratio: float | None = None
+    operating_cash_flow_ratio: float | None = None
+    interest_coverage: float | None = None
+    days_sales_outstanding: float | None = None
     revenue_growth: float | None = None
     earnings_per_share: float | None = None
     book_value_per_share: float | None = None
@@ -73,6 +80,10 @@ class FundamentalsSnapshot(BaseModel):
     # filing. Set only when build_snapshot is given a breakpoints table; None
     # means the blind prompt shows no size at all.
     size_percentile: int | None = None
+    # Deterministic FCF sign audit (prevents blind-mode '-' hiding chronic cash burn)
+    negative_fcf_periods: int = 0
+    # Deterministic 3-statement forensic accounting audit (when full dossier is available)
+    forensic_audit: ForensicAuditResult | None = None
 
     @property
     def content_hash(self) -> str:
@@ -134,6 +145,14 @@ class FundamentalsSnapshot(BaseModel):
                 f"| {_fmt(p.earnings_per_share)} | {_fmt(p.book_value_per_share)} "
                 f"| {_fmt(p.free_cash_flow_per_share)}"
             )
+        if self.negative_fcf_periods > 0:
+            lines.append(
+                f"\nCash Flow Sign Audit: {self.negative_fcf_periods}/{len(self.periods)} "
+                "filed periods had negative free cash flow."
+            )
+        if self.forensic_audit is not None:
+            lines.append("")
+            lines.append(self.forensic_audit.render_prompt_block(blind=False))
         return "\n".join(lines)
 
     def _render_blind(self) -> str:
@@ -156,6 +175,17 @@ class FundamentalsSnapshot(BaseModel):
             f"  Gross margin trend (latest-oldest): {_fmt(self.gross_margin_trend)}",
             f"  Book value/share CAGR: {_fmt(self.bvps_cagr)}",
             f"  Debt/equity (latest): {_fmt(self.debt_to_equity_latest)}",
+        ]
+        if self.negative_fcf_periods > 0:
+            fcf_signs = " ".join(
+                ("NEG" if (p.free_cash_flow_per_share is not None and p.free_cash_flow_per_share < 0) else
+                 "POS" if (p.free_cash_flow_per_share is not None and p.free_cash_flow_per_share > 0) else "-")
+                for p in self.periods
+            )
+            lines.append(
+                f"  FCF sign audit (newest->oldest): {self.negative_fcf_periods}/{len(self.periods)} negative [{fcf_signs}]"
+            )
+        lines += [
             "",
             "History (trailing-twelve-month periods, newest first):",
             "period | P/E | ROE | gross_m | op_m | net_m | D/E "
@@ -172,6 +202,9 @@ class FundamentalsSnapshot(BaseModel):
                 f"| {_per_share_index(p.free_cash_flow_per_share, oldest.free_cash_flow_per_share)} "
                 f"| {_fmt(self.eps_growth_yoy) if i == 0 else '-'}"
             )
+        if self.forensic_audit is not None:
+            lines.append("")
+            lines.append(self.forensic_audit.render_prompt_block(blind=True))
         return "\n".join(lines)
 
 
@@ -219,6 +252,17 @@ def build_snapshot(
     if breakpoints is not None and rows[0].filing_date is not None:
         size_percentile = breakpoints.size_percentile(rows[0].market_cap, rows[0].filing_date)
 
+    neg_fcf_periods = sum(
+        1 for r in rows if r.free_cash_flow_per_share is not None and r.free_cash_flow_per_share < 0
+    )
+
+    forensic_audit = None
+    get_dossier = getattr(data_client, "get_statement_dossier", None)
+    if callable(get_dossier):
+        dossier = get_dossier(ticker, as_of[:10], limit=periods)
+        if dossier is not None:
+            forensic_audit = ForensicAccountingGate().evaluate(dossier)
+
     return FundamentalsSnapshot(
         ticker=ticker,
         as_of=as_of,
@@ -235,6 +279,8 @@ def build_snapshot(
         market_cap_latest=metrics[0].market_cap,
         eps_growth_yoy=_eps_growth_yoy(rows),
         size_percentile=size_percentile,
+        negative_fcf_periods=neg_fcf_periods,
+        forensic_audit=forensic_audit,
     )
 
 
