@@ -60,8 +60,10 @@ from pathlib import Path
 
 from rich.console import Console
 
+from hedge_fund.analyze import run_analyze
 from hedge_fund.backtesting import backtest_fund, save_result
 from hedge_fund.data import CachedDataClient, CallMeter, FDClient
+from hedge_fund.data.tushare_client import TushareDataClient
 from hedge_fund.data.bars import is_intraday
 from hedge_fund.data.sessions import completed_through
 from hedge_fund.fund import Fund, load_spec, normalize_universe
@@ -107,7 +109,18 @@ def main() -> None:
 
     console = Console(stderr=True)  # status + summary on stderr; stdout stays pure JSON
     try:
-        if args.command == "backtest":
+        if args.command == "analyze":
+            run_analyze(
+                args.ticker,
+                as_of=args.as_of,
+                lang=args.lang,
+                agents_filter=args.agents,
+                enable_forensic=not args.no_forensic,
+                model=args.model,
+                save_json=args.save_json,
+                console=Console(),
+            )
+        elif args.command == "backtest":
             _backtest(args, parser, console)
         else:
             _paper(args, parser, console)
@@ -135,6 +148,19 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command")
 
+    analyze = commands.add_parser(
+        "analyze",
+        help="run A-share forensic audit + 5 investor masters on a single ticker",
+        description="Pull point-in-time A-share 3-statements, audit opinion & pledge data via Tushare Pro, "
+        "run deterministic ForensicAccountingGate, and present 5 investor personas in Chinese/English.",
+    )
+    analyze.add_argument("ticker", help="A-share code, e.g. 600519.SH, 600518.SH, or 000858")
+    analyze.add_argument("--as-of", default=None, help="point-in-time cutoff YYYY-MM-DD (default: today)")
+    analyze.add_argument("--lang", default="zh", choices=["zh", "en"], help="output reasoning language (default: zh)")
+    analyze.add_argument("--agents", default="all", help="comma-separated agents or 'all' for all 5 masters")
+    analyze.add_argument("--no-forensic", action="store_true", help="disable forensic gate to compare original 12-column view")
+    analyze.add_argument("--save-json", default=None, help="save full structured JSON report to path")
+
     backtest = commands.add_parser(
         "backtest", help="replay a mandate over history",
         description="Replay a mandate over history: every benchmark session from "
@@ -145,6 +171,7 @@ def _parser() -> argparse.ArgumentParser:
     backtest.add_argument("--universe", required=True, help=_UNIVERSE_HELP)
     backtest.add_argument("--start", help=f"first session YYYY-MM-DD (default: {BACKTEST_DAYS} days before --end)")
     backtest.add_argument("--end", help="last session YYYY-MM-DD (default: the latest completed session)")
+    backtest.add_argument("--data-source", default="fd", choices=["fd", "tushare"], help="market data provider (default: fd)")
     backtest.add_argument("--out", help="also write the result JSON to this file")
 
     paper = commands.add_parser("paper", help="deploy and advance a paper fund")
@@ -224,15 +251,24 @@ def _backtest(args, parser: argparse.ArgumentParser, console: Console) -> None:
     fund = Fund(spec, blind=True)
 
     meter = CallMeter()
-    with FDClient(meter=meter) as raw:
-        fd = CachedDataClient(raw)
+    if getattr(args, "data_source", "fd") == "tushare":
+        ts_client = TushareDataClient(enable_forensic=True)
         with console.status(
-            f"[cyan]{spec.name}: backtesting {start} → {end} "
-            f"({spec.rebalance} rebalance vs {spec.benchmark}) "
+            f"[cyan]{spec.name}: backtesting {start} → {end} via Tushare Pro "
             f"over {', '.join(universe)}…",
             spinner="dots",
         ):
-            result = backtest_fund(fund, start, end, fd, universe)
+            result = backtest_fund(fund, start, end, ts_client, universe)
+    else:
+        with FDClient(meter=meter) as raw:
+            fd = CachedDataClient(raw)
+            with console.status(
+                f"[cyan]{spec.name}: backtesting {start} → {end} "
+                f"({spec.rebalance} rebalance vs {spec.benchmark}) "
+                f"over {', '.join(universe)}…",
+                spinner="dots",
+            ):
+                result = backtest_fund(fund, start, end, fd, universe)
 
     payload = result.model_dump_json(indent=2)
     print(payload)

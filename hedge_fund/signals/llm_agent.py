@@ -53,6 +53,7 @@ class LLMAgent(AlphaModel):
         cache: PromptCache | None = None,
         blind: bool = False,
         breakpoints: MEBreakpoints | None = None,
+        lang: str = "en",
     ) -> None:
         self._llm = llm if llm is not None else make_llm()
         self._cache = cache if cache is not None else PromptCache()
@@ -64,6 +65,7 @@ class LLMAgent(AlphaModel):
         # blind; live runs don't and never touch the breakpoints.
         self._blind = blind
         self._breakpoints = breakpoints
+        self._lang = lang
 
     # ------------------------------------------------------------------
     # AlphaModel interface
@@ -103,6 +105,14 @@ class LLMAgent(AlphaModel):
             )
 
         system = self.get_system_prompt()
+        if self._lang.lower().startswith("zh"):
+            system = (
+                f"{system}\n\n"
+                "Language rule: Keep the JSON keys and signal values (bullish/bearish/neutral) "
+                "in English, but write the 'reasoning' field in sharp, concise, natural "
+                "Simplified Chinese (2-4 sentences) preserving your investor persona's voice "
+                "and citing concrete verified numbers from the data."
+            )
         user = self.build_user_prompt(snapshot)
         if is_intraday(date):
             # A bar, not a close: add the day so far. Bucketed, so a quiet

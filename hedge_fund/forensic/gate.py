@@ -270,8 +270,14 @@ class ForensicAccountingGate:
         inv_to_assets = p0.inventory / p0.total_assets if p0.total_assets > 0 else 0.0
         cogs = (p0.revenue - p0.gross_profit) if p0.gross_profit is not None else (p0.revenue * 0.7)
         inv_days = round((p0.inventory / cogs) * 365.0, 1) if cogs > 0 else 0.0
-        # Industry-aware guard: high gross margin (>80%, e.g. aged spirits) naturally carries high inventory days without debt/OCF stress
-        is_aged_inventory_profile = (p0.gross_margin or 0.0) >= 0.80 and p0.interest_bearing_debt == 0 and (ocf_to_ni_latest or 0.0) >= 0.95
+        # Industry-aware guard: high gross margin (>=75%, e.g. aged spirits) with minimal
+        # interest-bearing debt (<=5% of assets) and strong multi-year cash conversion (>=0.90)
+        # naturally carries long inventory aging cycles without solvency stress.
+        is_aged_inventory_profile = (
+            (p0.gross_margin or 0.0) >= 0.75
+            and debt_to_assets <= 0.05
+            and (ocf_to_ni_cum or 0.0) >= 0.90
+        )
         if inv_to_assets >= self.t.inventory_to_assets_high and inv_days >= self.t.inventory_days_high and not is_aged_inventory_profile:
             flags.append(
                 ForensicRedFlag(

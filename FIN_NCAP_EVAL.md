@@ -16,17 +16,22 @@
    - 触发严重红旗 `BEARISH_CAP` 时强制封顶最终信号，禁止 LLM 越权对雷股喊多，并保留 `llm_raw_signal` 供审计对比；
    - 修复截断 JSON 导致怀疑票静默弃权的问题。
 
-## 二、一键复现命令
+## 二、一键复现与 A 股实战尽调命令
 
 ```bash
-# 1. 运行全部单元测试（含原版 + 新增确定性排雷测试）
-pytest -q hedge_fund/forensic/ hedge_fund/features/test_snapshot.py hedge_fund/signals/test_llm_agents.py
+# 1. 运行全部单元测试（含原版 + 确定性排雷 + Tushare A 股适配器测试）
+pytest -q hedge_fund/data/test_tushare_client.py hedge_fund/forensic/ hedge_fund/features/test_snapshot.py hedge_fund/signals/test_llm_agents.py
 
-# 2. 查看 3 项改造的完整源码 Diff
+# 2. 查看全部源码 Diff（原版基线 -> A 股实战与确定性排雷二开版）
 git diff fin-ncap-baseline..HEAD -- hedge_fund/
 
-# 3. 验证公开考卷 C 数据集 SHA256 与确定性离线排雷门禁（零 API Key 即可跑通）
+# 3. 零 API Key 离线验证考卷 C 确定性排雷门禁
 python examples/exam_c_repro/verify_forensic_gate.py
+
+# 4. 真实 A 股实战尽调（需配置 TUSHARE_TOKEN 与任意大模型 Key，支持中文 5 大师全上）
+aihf analyze 600519.SH                               # 实时体检最新年报（默认中文 + 5 位大师）
+aihf analyze 600518.SH --as-of 2018-05-05 --no-forensic  # 时光机对照：原版 12 列视角
+aihf analyze 600518.SH --as-of 2018-05-05                # 时光机对照：二开确定性排雷门禁 ON
 ```
 
 ## 三、诚实边界声明
