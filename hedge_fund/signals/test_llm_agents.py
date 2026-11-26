@@ -325,3 +325,95 @@ def test_extract_json_embedded():
 def test_extract_json_raises_on_garbage():
     with pytest.raises(LLMParseError):
         extract_json("no json here at all")
+
+
+# ---------------------------------------------------------------------------
+# Forensic fail-closed gate, deterministic risk cap & truncated JSON recovery
+# ---------------------------------------------------------------------------
+
+def test_truncated_json_object_recovers_without_abstaining(tmp_path):
+    truncated = '```json\n{"signal": "neutral", "confidence": 75, "reasoning": "Margins are slidi'
+    agent = _agent(tmp_path, FakeLLM(truncated))
+    sig = agent.predict("TEST", "2025-01-15", MockDataClient(metrics=_history()))
+    assert sig.metadata["abstained"] is False
+    assert sig.metadata["signal"] == "neutral"
+    assert sig.metadata["confidence"] == 75.0
+    assert sig.metadata["truncated_recovered"] is True
+
+
+def test_forensic_fail_closed_short_circuits_llm(tmp_path):
+    from hedge_fund.forensic.models import (
+        AuditAndGovernanceNotes,
+        FinancialStatementDossier,
+        FinancialStatementPeriod,
+    )
+
+    class BrokenDossierClient(MockDataClient):
+        def get_statement_dossier(self, ticker, end_date, limit=10):
+            p = FinancialStatementPeriod(
+                report_period="2024-12-31",
+                filing_date="2024-12-31",
+                revenue=1000.0,
+                net_income=100.0,
+                operating_cash_flow=90.0,
+                free_cash_flow=50.0,
+                cash_and_equivalents=200.0,
+                interest_bearing_debt=100.0,
+                total_assets=5000.0,
+                total_liabilities=2000.0,
+                shareholders_equity=2500.0,  # 500M gap
+            )
+            return FinancialStatementDossier(
+                ticker=ticker,
+                periods=[p, p],
+                notes_and_audit=AuditAndGovernanceNotes(audit_opinion="Qualified Opinion"),
+            )
+
+    llm = FakeLLM(BULLISH)
+    agent = _agent(tmp_path, llm)
+    sig = agent.predict("TEST", "2025-01-15", BrokenDossierClient(metrics=_history()))
+    assert llm.calls == 0  # Fail-Closed never delegates to LLM
+    assert sig.value == pytest.approx(-1.0)
+    assert sig.metadata["fail_closed"] is True
+    assert "ACCOUNTING_IDENTITY_BROKEN" in sig.metadata["detected_red_flags"]
+
+
+def test_deterministic_risk_cap_overrides_bullish_llm_on_fraud_flags(tmp_path):
+    from hedge_fund.forensic.models import (
+        AuditAndGovernanceNotes,
+        FinancialStatementDossier,
+        FinancialStatementPeriod,
+    )
+
+    class FraudDossierClient(MockDataClient):
+        def get_statement_dossier(self, ticker, end_date, limit=10):
+            p = FinancialStatementPeriod(
+                report_period="2024-12-31",
+                filing_date="2024-12-31",
+                revenue=2000.0,
+                net_income=400.0,
+                operating_cash_flow=150.0,
+                free_cash_flow=80.0,
+                cash_and_equivalents=4500.0,
+                interest_bearing_debt=3000.0,
+                interest_income=20.0,
+                interest_expense=200.0,
+                total_assets=9000.0,
+                total_liabilities=5000.0,
+                shareholders_equity=4000.0,
+            )
+            return FinancialStatementDossier(
+                ticker=ticker,
+                periods=[p, p],
+                notes_and_audit=AuditAndGovernanceNotes(major_shareholder_pledge_ratio=0.92),
+            )
+
+    llm = FakeLLM(BULLISH)
+    agent = _agent(tmp_path, llm)
+    sig = agent.predict("TEST", "2025-01-15", FraudDossierClient(metrics=_history()))
+    assert llm.calls == 1
+    assert sig.metadata["signal"] == "bearish"
+    assert sig.metadata["llm_raw_signal"] == "bullish"
+    assert sig.metadata["risk_cap_overridden"] is True
+    assert sig.value <= -0.85
+

@@ -27,6 +27,7 @@ features/intraday.py. It is bucketed so quiet bars stay cache hits.
 from __future__ import annotations
 
 import logging
+import re
 
 from hedge_fund.data.bars import is_intraday
 from hedge_fund.data.protocol import DataClient
@@ -74,6 +75,32 @@ class LLMAgent(AlphaModel):
         except InsufficientData as exc:
             return self._abstain(ticker, date, f"insufficient data: {exc}")
         # Any other data-layer exception (e.g. FDClientError) propagates.
+
+        # Hard deterministic Fail-Closed gate ("A Prompt Is Not a Control"):
+        # broken accounting identity, non-standard audit opinion, or excessive
+        # external guarantees reject immediately without delegating to an LLM.
+        audit = snapshot.forensic_audit
+        if audit is not None and audit.fail_closed:
+            reasons_txt = "; ".join(audit.fail_closed_reasons)
+            return Signal(
+                model_name=self.name,
+                ticker=ticker,
+                date=date,
+                value=-1.0,
+                reasoning=f"FAIL-CLOSED deterministic rejection: {reasons_txt}",
+                metadata={
+                    "signal": "bearish",
+                    "confidence": 100.0,
+                    "model": "deterministic_forensic_gate",
+                    "snapshot_hash": snapshot.content_hash,
+                    "cached": False,
+                    "abstained": False,
+                    "fail_closed": True,
+                    "risk_cap": "FAIL_CLOSED",
+                    "detected_red_flags": audit.flag_codes,
+                    "gate_reasons": audit.fail_closed_reasons,
+                },
+            )
 
         system = self.get_system_prompt()
         user = self.build_user_prompt(snapshot)
@@ -156,8 +183,22 @@ class LLMAgent(AlphaModel):
     # ------------------------------------------------------------------
 
     def _parse(self, response: str) -> dict:
-        """Extract + validate {signal, confidence, reasoning}."""
-        data = extract_json(response)
+        """Extract + validate {signal, confidence, reasoning}.
+
+        Resiliently recovers truncated JSON objects (e.g., cut off mid-reasoning
+        by max_output_tokens) only when an explicit JSON object prefix with
+        valid `signal` and `confidence` fields is present; pure prose still
+        raises and abstains.
+        """
+        try:
+            data = extract_json(response)
+            truncated_recovered = False
+        except Exception:
+            data = self._recover_truncated_json(response)
+            if data is None:
+                raise
+            truncated_recovered = True
+
         signal = str(data.get("signal", "")).lower()
         if signal not in _SIGNAL_TO_SIGN:
             raise ValueError(f"invalid signal {data.get('signal')!r}")
@@ -169,11 +210,30 @@ class LLMAgent(AlphaModel):
             "confidence": confidence,
             "reasoning": str(data.get("reasoning", "")),
         }
+        if truncated_recovered:
+            parsed["truncated_recovered"] = True
         if "provider_metadata" in data:
             if not isinstance(data["provider_metadata"], dict):
                 raise ValueError("provider_metadata must be an object")
             parsed["provider_metadata"] = data["provider_metadata"]
         return parsed
+
+    @staticmethod
+    def _recover_truncated_json(response: str) -> dict | None:
+        """Recover signal/confidence/partial reasoning from a mid-stream truncated JSON object."""
+        if "{" not in response or '"signal"' not in response or '"confidence"' not in response:
+            return None
+        m_sig = re.search(r'"signal"\s*:\s*"(bullish|bearish|neutral)"', response, re.I)
+        m_conf = re.search(r'"confidence"\s*:\s*(\d+(?:\.\d+)?)', response)
+        if not m_sig or not m_conf:
+            return None
+        m_reason = re.search(r'"reasoning"\s*:\s*"([^"]*)', response)
+        reasoning = (m_reason.group(1).strip() + " [truncated]") if m_reason else "[truncated response recovered]"
+        return {
+            "signal": m_sig.group(1).lower(),
+            "confidence": float(m_conf.group(1)),
+            "reasoning": reasoning,
+        }
 
     def _to_signal(
         self,
@@ -184,24 +244,53 @@ class LLMAgent(AlphaModel):
         snapshot: FundamentalsSnapshot,
         cached: bool,
     ) -> Signal:
-        value = _SIGNAL_TO_SIGN[parsed["signal"]] * parsed["confidence"] / 100.0
+        raw_signal = parsed["signal"]
+        final_signal = raw_signal
+        confidence = parsed["confidence"]
+        reasoning = parsed["reasoning"]
+
+        audit = snapshot.forensic_audit
+        risk_cap_overridden = False
+        detected_flags = audit.flag_codes if audit is not None else []
+        risk_cap = audit.risk_cap if audit is not None else "NONE"
+
+        if audit is not None and audit.risk_cap == "BEARISH_CAP" and final_signal != "bearish":
+            risk_cap_overridden = True
+            final_signal = "bearish"
+            confidence = max(confidence, 85.0)
+            reasoning = (
+                f"[DETERMINISTIC RISK CAP OVERRIDE: LLM raw={raw_signal} blocked by "
+                f"{len(detected_flags)} red flags ({', '.join(detected_flags)})] {reasoning}"
+            )
+
+        value = _SIGNAL_TO_SIGN[final_signal] * confidence / 100.0
+        meta: dict = {
+            "signal": final_signal,
+            "confidence": confidence,
+            "model": self._llm.model,
+            "prompt_key": key,
+            "snapshot_hash": snapshot.content_hash,
+            "cached": cached,
+            "abstained": False,
+        }
+        if audit is not None:
+            meta["fail_closed"] = audit.fail_closed
+            meta["risk_cap"] = risk_cap
+            meta["detected_red_flags"] = detected_flags
+            meta["llm_raw_signal"] = raw_signal
+            meta["risk_cap_overridden"] = risk_cap_overridden
+        if parsed.get("truncated_recovered"):
+            meta["truncated_recovered"] = True
+        if "provider_metadata" in parsed:
+            meta["provider_metadata"] = parsed["provider_metadata"]
+
         return Signal(
             model_name=self.name,
             ticker=ticker,
             date=date,
             value=value,
-            reasoning=parsed["reasoning"],
-            metadata={
-                "signal": parsed["signal"],
-                "confidence": parsed["confidence"],
-                "model": self._llm.model,
-                "prompt_key": key,
-                "snapshot_hash": snapshot.content_hash,
-                "cached": cached,
-                "abstained": False,
-                **({"provider_metadata": parsed["provider_metadata"]}
-                   if "provider_metadata" in parsed else {}),
-            },
+            reasoning=reasoning,
+            metadata=meta,
         )
 
     def _abstain(self, ticker: str, date: str, reason: str) -> Signal:
